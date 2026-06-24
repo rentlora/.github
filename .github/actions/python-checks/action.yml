@@ -1,0 +1,34 @@
+name: python-checks
+description: Compile-check (compileall) and lint (ruff) a Python service.
+
+inputs:
+  context:
+    description: Service directory (e.g. backend/property-service).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+        cache: pip
+        cache-dependency-path: ${{ inputs.context }}/requirements.txt
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ inputs.context }}
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt ruff
+
+    - name: Compile check
+      shell: bash
+      working-directory: ${{ inputs.context }}
+      run: python -m compileall -q .
+
+    - name: Lint
+      shell: bash
+      working-directory: ${{ inputs.context }}
+      run: ruff check .
