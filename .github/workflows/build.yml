@@ -1,0 +1,97 @@
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Service name (e.g. user-service, frontend)"
+        required: true
+        type: string
+    secrets:
+      AWS_CI_ROLE_ARN:
+        required: true
+      HELM_REPO_TOKEN:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: false
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  build:
+    name: build + push
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/rentlora-${{ inputs.service }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ inputs.service }}
+          cache-to: type=gha,scope=${{ inputs.service }},mode=max
+
+      - name: Notify failure
+        if: failure()
+        uses: rentlora/.github/.github/actions/notify@main
+        with:
+          status: failure
+          title: "build failed: ${{ inputs.service }}"
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  bump-dev:
+    name: bump dev image tag
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: rentlora/rentlora-helm
+          token: ${{ secrets.HELM_REPO_TOKEN }}
+
+      - name: Bump dev tag
+        env:
+          TAG: ${{ github.sha }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          yq -i ".imageTags.\"${SERVICE}\" = \"${TAG}\"" environments/dev/values.yaml
+          git config user.name  "rentlora-ci"
+          git config user.email "ci@rentlora.in"
+          git add environments/dev/values.yaml
+          git commit -m "ci: bump dev ${SERVICE} → ${TAG}" || exit 0
+          git push
+
+      - name: Notify success
+        if: success()
+        uses: rentlora/.github/.github/actions/notify@main
+        with:
+          status: success
+          title: "dev deploy triggered: ${{ inputs.service }}"
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          details: "ArgoCD syncing → dev.rentlora.in"
+
+      - name: Notify failure
+        if: failure()
+        uses: rentlora/.github/.github/actions/notify@main
+        with:
+          status: failure
+          title: "dev tag bump failed: ${{ inputs.service }}"
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          details: "commit ${{ github.sha }}"

@@ -1,0 +1,114 @@
+name: ci-backend
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Service name matching the ECR repo suffix (e.g. user-service)"
+        required: true
+        type: string
+    secrets:
+      SNYK_TOKEN:
+        required: true
+      SONAR_TOKEN:
+        required: false
+      SLACK_WEBHOOK_URL:
+        required: false
+
+jobs:
+  compile-lint:
+    name: compile + lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rentlora/.github/.github/actions/python-checks@main
+        with:
+          context: .
+
+  sast:
+    name: SAST (SonarCloud)
+    needs: compile-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sca:
+    name: SCA — Snyk
+    needs: sast
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install service deps
+        run: pip install -r requirements.txt
+      - uses: rentlora/.github/.github/actions/snyk-test@main
+        with:
+          args: --file=requirements.txt --package-manager=pip
+
+  image-scan:
+    name: build + scan
+    needs: sca
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: rentlora-${{ inputs.service }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ inputs.service }}
+      - uses: rentlora/.github/.github/actions/trivy-scan@main
+        with:
+          image-ref: rentlora-${{ inputs.service }}:${{ github.sha }}
+          category: image-${{ inputs.service }}
+
+  ci-complete:
+    name: ci-complete
+    if: always()
+    needs: [compile-lint, sast, sca, image-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Gate
+        env:
+          RESULT: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          if [ "$RESULT" = "true" ]; then
+            echo "CI failed."
+            exit 1
+          fi
+          echo "CI passed."
+      - uses: actions/checkout@v4
+        if: failure()
+      - uses: rentlora/.github/.github/actions/notify@main
+        if: failure()
+        with:
+          status: failure
+          title: "${{ inputs.service }} CI failed — PR #${{ github.event.pull_request.number }}"
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          details: "${{ github.head_ref }}"

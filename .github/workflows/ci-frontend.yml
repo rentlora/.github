@@ -1,0 +1,90 @@
+name: ci-frontend
+
+on:
+  workflow_call:
+    secrets:
+      SNYK_TOKEN:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: false
+
+jobs:
+  build-check:
+    name: lint + build check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+
+  sca:
+    name: SCA — Snyk (npm)
+    needs: build-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - uses: rentlora/.github/.github/actions/snyk-test@main
+
+  image-scan:
+    name: build + scan
+    needs: sca
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: rentlora-frontend:${{ github.sha }}
+          cache-from: type=gha,scope=frontend
+      - uses: rentlora/.github/.github/actions/trivy-scan@main
+        with:
+          image-ref: rentlora-frontend:${{ github.sha }}
+          category: image-frontend
+
+  ci-complete:
+    name: ci-complete
+    if: always()
+    needs: [build-check, sca, image-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Gate
+        env:
+          RESULT: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          if [ "$RESULT" = "true" ]; then
+            echo "Frontend CI failed."
+            exit 1
+          fi
+          echo "Frontend CI passed."
+      - uses: actions/checkout@v4
+        if: failure()
+      - uses: rentlora/.github/.github/actions/notify@main
+        if: failure()
+        with:
+          status: failure
+          title: "frontend CI failed — PR #${{ github.event.pull_request.number }}"
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          details: "${{ github.head_ref }}"

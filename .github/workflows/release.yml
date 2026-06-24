@@ -1,0 +1,111 @@
+name: release
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Service name (e.g. user-service, frontend)"
+        required: true
+        type: string
+    secrets:
+      AWS_CI_ROLE_ARN:
+        required: true
+      HELM_REPO_TOKEN:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: false
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  prepare:
+    name: snapshot dev image tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.snap.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: rentlora/rentlora-helm
+          token: ${{ secrets.HELM_REPO_TOKEN }}
+
+      - name: Snapshot
+        id: snap
+        run: |
+          sha=$(yq ".imageTags.\"${{ inputs.service }}\"" environments/dev/values.yaml)
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "Promoting ${{ inputs.service }}:${sha} → ${{ github.event.release.tag_name }}"
+
+  deploy:
+    name: deploy production (${{ github.event.release.tag_name }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Re-tag image as ${{ github.event.release.tag_name }}
+        env:
+          SHA: ${{ needs.prepare.outputs.sha }}
+          VERSION: ${{ github.event.release.tag_name }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          repo="rentlora-${SERVICE}"
+          manifest=$(aws ecr batch-get-image --repository-name "$repo" \
+            --image-ids imageTag="$SHA" --query 'images[0].imageManifest' --output text)
+          if [ -z "$manifest" ] || [ "$manifest" = "None" ]; then
+            echo "::error::missing image ${repo}:${SHA}"; exit 1
+          fi
+          if aws ecr put-image --repository-name "$repo" --image-tag "$VERSION" \
+               --image-manifest "$manifest" >/dev/null 2>&1; then
+            echo "retagged ${repo}:${SHA} → ${VERSION}"
+          else
+            echo "${repo}:${VERSION} already present (ok)"
+          fi
+
+      - name: Checkout rentlora-helm
+        uses: actions/checkout@v4
+        with:
+          repository: rentlora/rentlora-helm
+          token: ${{ secrets.HELM_REPO_TOKEN }}
+          path: helm
+
+      - name: Pin prod tag for ${{ inputs.service }}
+        env:
+          VERSION: ${{ github.event.release.tag_name }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          cd helm
+          yq -i ".imageTags.\"${SERVICE}\" = \"${VERSION}\"" environments/prod/values.yaml
+          git config user.name  "rentlora-ci"
+          git config user.email "ci@rentlora.in"
+          git add environments/prod/values.yaml
+          git commit -m "release: ${SERVICE} ${VERSION}"
+          git push
+
+      - name: Notify success
+        if: success()
+        uses: rentlora/.github/.github/actions/notify@main
+        with:
+          status: success
+          title: "prod release ${{ inputs.service }} ${{ github.event.release.tag_name }}"
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          details: "ArgoCD syncing → rentlora.in"
+
+      - name: Notify failure
+        if: failure()
+        uses: rentlora/.github/.github/actions/notify@main
+        with:
+          status: failure
+          title: "prod release ${{ inputs.service }} ${{ github.event.release.tag_name }} FAILED"
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          details: "check run logs"
