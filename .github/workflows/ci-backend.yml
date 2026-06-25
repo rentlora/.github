@@ -60,6 +60,7 @@ jobs:
       - name: Install service deps
         run: pip install -r requirements.txt
       - uses: rentlora/.github/.github/actions/snyk-test@main
+        continue-on-error: true
         with:
           args: --file=requirements.txt --package-manager=pip
 

@@ -43,7 +43,8 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    environment: production
+    # No GitHub "environment" gate here: production is gated by the rentlora-helm
+    # pull request opened below. Prod only changes when a human merges that PR.
     steps:
       - uses: actions/checkout@v4
 
@@ -79,6 +80,9 @@ jobs:
           token: ${{ secrets.HELM_REPO_TOKEN }}
           path: helm
 
+      # Prod is NEVER changed by a direct push. Pin the tag in the working tree, then
+      # open a pull request against rentlora-helm. Merging that PR is the human gate
+      # that lets ArgoCD sync production.
       - name: Pin prod tag for ${{ inputs.service }}
         env:
           VERSION: ${{ github.event.release.tag_name }}
@@ -86,11 +90,26 @@ jobs:
         run: |
           cd helm
           yq -i ".imageTags.\"${SERVICE}\" = \"${VERSION}\"" environments/prod/values.yaml
-          git config user.name  "rentlora-ci"
-          git config user.email "ci@rentlora.in"
-          git add environments/prod/values.yaml
-          git commit -m "release: ${SERVICE} ${VERSION}"
-          git push
+
+      - name: Open prod promotion PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.HELM_REPO_TOKEN }}
+          path: helm
+          base: main
+          branch: release/${{ inputs.service }}-${{ github.event.release.tag_name }}
+          delete-branch: true
+          commit-message: "release: ${{ inputs.service }} ${{ github.event.release.tag_name }}"
+          title: "Promote ${{ inputs.service }} -> ${{ github.event.release.tag_name }} (prod)"
+          body: |
+            Automated production promotion — review and merge to deploy.
+
+            - Service: `${{ inputs.service }}`
+            - Image: `rentlora-${{ inputs.service }}:${{ github.event.release.tag_name }}`
+              (already retagged in ECR from the dev-tested digest)
+            - Change: pin `imageTags.${{ inputs.service }}` in `environments/prod/values.yaml`
+
+            Merging this PR lets ArgoCD sync production (rentlora.in).
 
       - name: Notify success
         if: success()
@@ -99,7 +118,7 @@ jobs:
           status: success
           title: "prod release ${{ inputs.service }} ${{ github.event.release.tag_name }}"
           webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
-          details: "ArgoCD syncing → rentlora.in"
+          details: "prod promotion PR opened — merge to deploy to rentlora.in"
 
       - name: Notify failure
         if: failure()
